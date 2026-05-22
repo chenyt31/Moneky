@@ -12,6 +12,9 @@ dist
 
 # Data
 !**/alpaca-data-conversation.json
+
+# Local outputs (visualizations, checkpoints, etc.)
+outputs/
 # Editor
 .idea
 *.swp

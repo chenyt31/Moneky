@@ -1,4 +1,6 @@
 # Python
+.venv/
+.python-version
 __pycache__
 *.pyc
 *.egg-info

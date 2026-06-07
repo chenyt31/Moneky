@@ -149,7 +149,10 @@ class WristVideoSFTDataset(Dataset):
 
     For history end index ``t`` (0-based, inclusive):
       - Input: video frames ``[hist_start, t]`` and wrist pairs for the same indices
-      - Target: wrist pairs at frames ``t+1 .. t+future_k`` (absolute camera coords)
+      - Target: wrist pairs at frames ``t+1 ..`` up to ``future_k`` steps (padded at episode end)
+
+    When fewer than ``future_k`` frames remain after ``t``, future targets are zero-padded
+    to length ``future_k`` and ``future_wrist_mask`` is False on padded steps (excluded from loss).
 
     Wrist layout per timestep: left (3,) and right (3,); missing hand -> None.
     Batched tensors use NaN + ``*_mask`` for missing values.
@@ -164,6 +167,7 @@ class WristVideoSFTDataset(Dataset):
         image_size: Tuple[int, int] = (224, 224),
         transform: Optional[Callable[[np.ndarray], torch.Tensor]] = None,
         episode_pairs: Optional[List[Dict[str, str]]] = None,
+        load_video: bool = True,
     ):
         self.data_root = data_root
         self.future_k = future_k
@@ -171,6 +175,7 @@ class WristVideoSFTDataset(Dataset):
         self.min_history = min_history
         self.image_size = image_size
         self.transform = transform
+        self.load_video = load_video
 
         self.episode_pairs = episode_pairs or discover_episode_pairs(data_root)
         self.samples: List[Dict] = []
@@ -182,16 +187,19 @@ class WristVideoSFTDataset(Dataset):
             ann = np.load(ep["ann_path"], allow_pickle=True).item()
             decode_frames = ann["video_decode_frame"]
             num_frames = len(decode_frames)
-            # Need t+1 history frames (0..t) and t+1..t+K future wrist targets.
-            for t in range(num_frames - self.future_k):
+            # History 0..t; future t+1.. (pad to K at episode tail). Skip if no future frame.
+            for t in range(num_frames):
                 hist_len = t + 1
                 if hist_len < self.min_history:
+                    continue
+                if t >= num_frames - 1:
                     continue
                 self.samples.append(
                     {
                         "episode_idx": ep_idx,
                         "hist_end": t,
                         "hist_len": hist_len,
+                        "future_valid": min(self.future_k, num_frames - 1 - t),
                     }
                 )
 
@@ -214,8 +222,11 @@ class WristVideoSFTDataset(Dataset):
         hist_indices = list(range(hist_start, hist_end + 1))
         decode_hist = [decode_frames[i] for i in hist_indices]
 
-        frames = _load_video_frames(ep["video_path"], decode_hist)
-        frames = _resize_frames(frames, self.image_size)
+        if self.load_video:
+            frames = _load_video_frames(ep["video_path"], decode_hist)
+            frames = _resize_frames(frames, self.image_size)
+        else:
+            frames = np.zeros((len(decode_hist), self.image_size[0], self.image_size[1], 3), dtype=np.uint8)
 
         history_wrists = []
         history_masks = []
@@ -224,10 +235,17 @@ class WristVideoSFTDataset(Dataset):
             history_wrists.append(w)
             history_masks.append(m)
 
+        num_frames = len(decode_frames)
         future_wrists = []
         future_masks = []
-        for i in range(hist_end + 1, hist_end + 1 + self.future_k):
-            w, m = _wrist_pair_to_array(parse_wrist_pair(ann, i))
+        for k in range(self.future_k):
+            frame_i = hist_end + 1 + k
+            if frame_i < num_frames:
+                w, m = _wrist_pair_to_array(parse_wrist_pair(ann, frame_i))
+            else:
+                # Pad action chunk to future_k; masked out in loss / viz.
+                w = np.full((2, 3), np.nan, dtype=np.float32)
+                m = np.zeros(2, dtype=bool)
             future_wrists.append(w)
             future_masks.append(m)
 
@@ -235,6 +253,7 @@ class WristVideoSFTDataset(Dataset):
         history_masks = np.stack(history_masks, axis=0)  # (T, 2)
         future_wrists = np.stack(future_wrists, axis=0)  # (K, 2, 3)
         future_masks = np.stack(future_masks, axis=0)  # (K, 2)
+        future_valid = min(self.future_k, num_frames - 1 - hist_end)
 
         if self.transform is not None:
             history_frames = self.transform(frames)
@@ -248,12 +267,15 @@ class WristVideoSFTDataset(Dataset):
             "history_wrist_mask": torch.from_numpy(history_masks),
             "future_wrists": torch.from_numpy(future_wrists),
             "future_wrist_mask": torch.from_numpy(future_masks),
+            "future_valid": future_valid,
             "hist_len": len(hist_indices),
             "hist_start": hist_start,
             "hist_end": hist_end,
             "video_path": ep["video_path"],
             "ann_path": ep["ann_path"],
             "video_name": ann["video_name"],
+            "sample_idx": index,
+            "episode_idx": sample["episode_idx"],
         }
 
 
@@ -261,9 +283,13 @@ class WristVideoSFTDataset(Dataset):
 class WristVideoSFTCollator:
     """Pad variable-length history; stack fixed-length future targets."""
 
+    pad_to_max_hist: int = 0  # if >0, always pad history to this length (right-aligned)
+
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         batch_size = len(instances)
         max_hist = max(inst["hist_len"] for inst in instances)
+        if self.pad_to_max_hist > 0:
+            max_hist = self.pad_to_max_hist
         k = instances[0]["future_wrists"].shape[0]
         _, _, h, w = instances[0]["history_frames"].shape
 
@@ -274,6 +300,7 @@ class WristVideoSFTCollator:
 
         future_wrists = torch.stack([inst["future_wrists"] for inst in instances], dim=0)
         future_wrist_mask = torch.stack([inst["future_wrist_mask"] for inst in instances], dim=0)
+        future_valid = torch.tensor([inst["future_valid"] for inst in instances], dtype=torch.long)
 
         for b, inst in enumerate(instances):
             t = inst["hist_len"]
@@ -291,10 +318,13 @@ class WristVideoSFTCollator:
             "history_len": history_len,
             "future_wrists": future_wrists,
             "future_wrist_mask": future_wrist_mask,
+            "future_valid": future_valid,
             "future_k": k,
             "video_paths": [inst["video_path"] for inst in instances],
             "ann_paths": [inst["ann_path"] for inst in instances],
             "hist_ends": torch.tensor([inst["hist_end"] for inst in instances], dtype=torch.long),
+            "sample_idx": torch.tensor([inst["sample_idx"] for inst in instances], dtype=torch.long),
+            "episode_idx": torch.tensor([inst["episode_idx"] for inst in instances], dtype=torch.long),
         }
 
 

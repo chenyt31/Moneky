@@ -1,4 +1,4 @@
-"""Wrist trajectory head on top of LLaVA-OneVision (HF) with official video encoding."""
+"""Wrist trajectory head on top of LLaVA-OneVision-2 (codec video backend)."""
 
 from __future__ import annotations
 
@@ -7,8 +7,9 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from transformers import LlavaOnevisionForConditionalGeneration
+from transformers import AutoModelForImageTextToText
 
+from llava.wrist.constants import DEFAULT_OV2_CKPT
 from llava.wrist.metrics import compute_wrist_metrics, masked_wrist_loss
 from llava.wrist.normalize import WristNormStats, denormalize_wrist_tensor, normalize_wrist_tensor
 
@@ -25,19 +26,18 @@ def _resolve_llava_dtype(torch_dtype: str) -> torch.dtype:
 
 @dataclass
 class WristLlavaOVConfig:
-    model_name_or_path: str = "llava-hf/llava-onevision-qwen2-0.5b-ov-hf"
+    model_name_or_path: str = DEFAULT_OV2_CKPT
     future_k: int = 16
     freeze_llava: bool = True
     use_lm_hidden: bool = True
     dropout: float = 0.1
-    torch_dtype: str = "auto"  # auto -> bfloat16 on CUDA if supported, else float16
+    torch_dtype: str = "auto"
 
 
 class WristLlavaOneVisionModel(nn.Module):
     """
-    Uses LlavaOnevisionForConditionalGeneration video pathway:
-      pixel_values_videos -> get_video_features / full forward with video tokens
-    Then fuses pooled LM hidden state with history wrist features for regression.
+    LLaVA-OneVision-2 video pathway via codec-preprocessed patches:
+      pixel_values + image_grid_thw + patch_positions -> language model hidden states
     """
 
     def __init__(
@@ -52,8 +52,9 @@ class WristLlavaOneVisionModel(nn.Module):
         self._norm_std: Optional[torch.Tensor] = None
         dtype = _resolve_llava_dtype(self.config.torch_dtype)
 
-        self.llava = LlavaOnevisionForConditionalGeneration.from_pretrained(
+        self.llava = AutoModelForImageTextToText.from_pretrained(
             self.config.model_name_or_path,
+            trust_remote_code=True,
             torch_dtype=dtype,
         )
         hidden = self.llava.config.text_config.hidden_size
@@ -79,7 +80,6 @@ class WristLlavaOneVisionModel(nn.Module):
             self.llava.requires_grad_(True)
             self.llava.train()
 
-        # Wrist head in fp32 for stable regression; LLaVA stays in fp16/bf16.
         self.wrist_encoder.to(dtype=torch.float32)
         self.head.to(dtype=torch.float32)
         self.video_ctx_norm.to(dtype=torch.float32)
@@ -87,8 +87,6 @@ class WristLlavaOneVisionModel(nn.Module):
     def enable_gradient_checkpointing(self) -> None:
         if hasattr(self.llava, "gradient_checkpointing_enable"):
             self.llava.gradient_checkpointing_enable()
-        elif hasattr(self.llava, "model") and hasattr(self.llava.model, "gradient_checkpointing_enable"):
-            self.llava.model.gradient_checkpointing_enable()
 
     def trainable_parameter_groups(
         self,
@@ -97,7 +95,6 @@ class WristLlavaOneVisionModel(nn.Module):
         llava_lr: float,
         weight_decay: float,
     ) -> list[dict]:
-        """Separate LR for LLaVA backbone vs wrist head."""
         llava_params, head_params = [], []
         for name, p in self.named_parameters():
             if not p.requires_grad:
@@ -151,32 +148,33 @@ class WristLlavaOneVisionModel(nn.Module):
 
     def _encode_video_context(
         self,
-        pixel_values_videos: torch.Tensor,
+        pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        patch_positions: torch.Tensor,
     ) -> torch.Tensor:
-        """LLaVA-OneVision video modality: embed video tokens and run the language model."""
-        pixel_values_videos = pixel_values_videos.to(device=self.llava.device, dtype=self.llava_dtype)
-        input_ids = input_ids.to(self.llava.device)
-        attention_mask = attention_mask.to(self.llava.device)
+        device = self.llava.device
+        pixel_values = pixel_values.to(device=device, dtype=self.llava_dtype)
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        image_grid_thw = image_grid_thw.to(device)
+        patch_positions = patch_positions.to(device)
 
+        forward_kwargs = dict(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            patch_positions=patch_positions,
+            output_hidden_states=True,
+            return_dict=True,
+        )
         if self.config.freeze_llava:
             with torch.no_grad():
-                outputs = self.llava(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pixel_values_videos=pixel_values_videos,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
+                outputs = self.llava(**forward_kwargs)
         else:
-            outputs = self.llava(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values_videos=pixel_values_videos,
-                output_hidden_states=True,
-                return_dict=True,
-            )
+            outputs = self.llava(**forward_kwargs)
 
         hidden = outputs.hidden_states[-1].float()
         if attention_mask is not None:
@@ -184,14 +182,15 @@ class WristLlavaOneVisionModel(nn.Module):
             ctx = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
         else:
             ctx = hidden.mean(dim=1)
-        ctx = torch.nan_to_num(ctx, nan=0.0, posinf=0.0, neginf=0.0)
-        return ctx
+        return torch.nan_to_num(ctx, nan=0.0, posinf=0.0, neginf=0.0)
 
     def forward(
         self,
-        pixel_values_videos: torch.Tensor,
+        pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        patch_positions: torch.Tensor,
         history_wrists: torch.Tensor,
         history_wrist_mask: torch.Tensor,
         history_len: torch.Tensor,
@@ -206,7 +205,11 @@ class WristLlavaOneVisionModel(nn.Module):
             if future_wrists is not None:
                 fut_tgt = normalize_wrist_tensor(future_wrists, future_wrist_mask, mean, std)
 
-        video_ctx = self.video_ctx_norm(self._encode_video_context(pixel_values_videos, input_ids, attention_mask))
+        video_ctx = self.video_ctx_norm(
+            self._encode_video_context(
+                pixel_values, input_ids, attention_mask, image_grid_thw, patch_positions
+            )
+        )
         wrist_ctx = self._pool_history_wrists(hist_in, history_wrist_mask, history_len)
 
         fused = torch.cat([self.dropout(video_ctx), self.dropout(wrist_ctx)], dim=-1)

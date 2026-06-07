@@ -22,6 +22,7 @@ from transformers import AutoProcessor
 from datasets.wrist_video_sft import WristVideoSFTCollator, WristVideoSFTDataset, discover_episode_pairs
 from llava.wrist.collator import WristLlavaCollator
 from llava.wrist.metrics import compute_wrist_metrics
+from llava.wrist.constants import DEFAULT_CODEC_MAX_PIXELS, DEFAULT_OV2_CKPT
 from llava.wrist.model import WristLlavaOVConfig, WristLlavaOneVisionModel
 from llava.wrist.normalize import WristNormStats, compute_wrist_norm_stats
 from llava.wrist.overfit_model import WristOverfitConfig, WristOverfitMLP
@@ -51,25 +52,25 @@ def build_video_cache(
     dataset: WristVideoSFTDataset,
     device: torch.device,
     *,
-    frames_upbound: int,
     future_k: int,
+    max_pixels: int = DEFAULT_CODEC_MAX_PIXELS,
 ) -> dict[int, torch.Tensor]:
-    processor = AutoProcessor.from_pretrained(model_name)
+    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
     ov = WristLlavaOneVisionModel(WristLlavaOVConfig(model_name_or_path=model_name, freeze_llava=True))
     ov.llava.to(device)
     ov.eval()
 
-    collator = WristLlavaCollator(processor=processor, frames_upbound=frames_upbound, future_k=future_k)
+    collator = WristLlavaCollator(processor=processor, future_k=future_k, max_pixels=max_pixels)
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collator)
     cache: dict[int, torch.Tensor] = {}
     for batch in loader:
-        batch = {
-            k: v.to(device, dtype=torch.float16) if k == "pixel_values_videos" and torch.is_tensor(v)
-            else v.to(device) if torch.is_tensor(v) else v
-            for k, v in batch.items()
-        }
+        batch = _to_device_llava(batch, device)
         ctx = ov._encode_video_context(
-            batch["pixel_values_videos"], batch["input_ids"], batch["attention_mask"]
+            batch["pixel_values"],
+            batch["input_ids"],
+            batch["attention_mask"],
+            batch["image_grid_thw"],
+            batch["patch_positions"],
         )
         sid = int(batch["sample_idx"][0].item())
         cache[sid] = ctx[0].cpu()
@@ -123,16 +124,22 @@ def _save_ckpt(
     torch.save(payload, os.path.join(output_dir, filename))
 
 
+def _llava_vision_dtype(device: torch.device) -> torch.dtype:
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
 def _to_device_llava(batch: dict, device: torch.device) -> dict:
+    vdtype = _llava_vision_dtype(device)
     out = {}
     for k, v in batch.items():
-        if torch.is_tensor(v):
-            if k == "pixel_values_videos":
-                out[k] = v.to(device, dtype=torch.float16)
-            else:
-                out[k] = v.to(device)
-        else:
+        if not torch.is_tensor(v):
             out[k] = v
+        elif k == "pixel_values":
+            out[k] = v.to(device, dtype=vdtype)
+        else:
+            out[k] = v.to(device)
     return out
 
 
@@ -145,9 +152,11 @@ def evaluate_llava(model: WristLlavaOneVisionModel, loader, device) -> dict:
     for batch in loader:
         batch = _to_device_llava(batch, device)
         out = model(
-            pixel_values_videos=batch["pixel_values_videos"],
+            pixel_values=batch["pixel_values"],
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
+            image_grid_thw=batch["image_grid_thw"],
+            patch_positions=batch["patch_positions"],
             history_wrists=batch["history_wrists"],
             history_wrist_mask=batch["history_wrist_mask"],
             history_len=batch["history_len"],
@@ -184,7 +193,7 @@ def train_llava_full(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     use_amp = device.type == "cuda"
 
-    processor = AutoProcessor.from_pretrained(args.model_name_or_path)
+    processor = AutoProcessor.from_pretrained(args.model_name_or_path, trust_remote_code=True)
     ds = WristVideoSFTDataset(
         data_root=args.data_root,
         future_k=args.future_k,
@@ -193,8 +202,8 @@ def train_llava_full(args: argparse.Namespace) -> None:
     )
     collator = WristLlavaCollator(
         processor=processor,
-        frames_upbound=args.frames_upbound,
         future_k=args.future_k,
+        max_pixels=args.max_pixels,
     )
     loader = DataLoader(
         ds,
@@ -239,11 +248,13 @@ def train_llava_full(args: argparse.Namespace) -> None:
         for batch in loader:
             batch = _to_device_llava(batch, device)
             optim.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            with torch.autocast(device_type=device.type, dtype=_llava_vision_dtype(device), enabled=use_amp):
                 out = model(
-                    pixel_values_videos=batch["pixel_values_videos"],
+                    pixel_values=batch["pixel_values"],
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
+                    image_grid_thw=batch["image_grid_thw"],
+                    patch_positions=batch["patch_positions"],
                     history_wrists=batch["history_wrists"],
                     history_wrist_mask=batch["history_wrist_mask"],
                     history_len=batch["history_len"],
@@ -312,7 +323,7 @@ def train(args: argparse.Namespace) -> None:
             print("Building LLaVA video_ctx cache (one-time)...")
             video_cache = build_video_cache(
                 args.model_name_or_path, ds, device,
-                frames_upbound=args.frames_upbound, future_k=args.future_k,
+                future_k=args.future_k, max_pixels=args.max_pixels,
             )
             torch.save({"cache": video_cache, "future_k": args.future_k}, cache_path)
             print(f"Saved cache: {cache_path}")
@@ -421,12 +432,12 @@ def parse_args():
     p.add_argument("--mode", choices=["mlp", "llava", "llava_full"], default="mlp")
     p.add_argument("--data_root", default=str(root / "data"))
     p.add_argument("--output_dir", default=str(root / "outputs" / "wrist_overfit"))
-    p.add_argument("--model_name_or_path", default="llava-hf/llava-onevision-qwen2-0.5b-ov-hf")
+    p.add_argument("--model_name_or_path", default=DEFAULT_OV2_CKPT)
     p.add_argument("--video_cache_path", default=None)
     p.add_argument("--rebuild_cache", action="store_true")
     p.add_argument("--future_k", type=int, default=16)
     p.add_argument("--max_history", type=int, default=0)
-    p.add_argument("--frames_upbound", type=int, default=8)
+    p.add_argument("--max_pixels", type=int, default=DEFAULT_CODEC_MAX_PIXELS, help="Codec per-canvas pixel budget")
     p.add_argument("--hidden", type=int, default=2048)
     p.add_argument("--depth", type=int, default=4)
     p.add_argument("--epochs", type=int, default=500)

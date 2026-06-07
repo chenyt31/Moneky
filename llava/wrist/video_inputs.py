@@ -1,4 +1,4 @@
-"""Build LLaVA-OneVision video inputs from wrist SFT samples (HF processor path)."""
+"""Build LLaVA-OneVision-2 codec video inputs for wrist SFT samples."""
 
 from __future__ import annotations
 
@@ -6,31 +6,8 @@ from typing import Dict, List, Sequence
 
 import numpy as np
 import torch
-from decord import VideoReader, cpu
-from PIL import Image
 
-
-def uniform_sample_indices(indices: Sequence[int], max_frames: int) -> List[int]:
-    """Uniformly subsample frame indices (LLaVA-style frames_upbound)."""
-    idx = list(indices)
-    if max_frames <= 0 or len(idx) <= max_frames:
-        return idx
-    sampled = np.linspace(0, len(idx) - 1, max_frames, dtype=int)
-    return [idx[i] for i in sampled]
-
-
-def load_video_frames_pil(
-    video_path: str,
-    decode_frame_ids: Sequence[int],
-    *,
-    max_frames: int = 8,
-) -> List[Image.Image]:
-    """Load RGB PIL frames from video at annotation decode indices."""
-    decode_frame_ids = uniform_sample_indices(decode_frame_ids, max_frames)
-    vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
-    frames = vr.get_batch(list(decode_frame_ids)).asnumpy()
-    vr.seek(0)
-    return [Image.fromarray(f) for f in frames]
+from llava.wrist.constants import DEFAULT_CODEC_MAX_PIXELS
 
 
 def format_history_wrist_prompt(
@@ -59,59 +36,86 @@ def format_history_wrist_prompt(
     return "History wrists (camera m): " + "; ".join(lines)
 
 
-def build_wrist_video_prompt(processor, history_text: str, future_k: int) -> str:
-    """Prompt with a single <video> placeholder (expanded by the processor)."""
-    return (
-        f"{processor.video_token}\n"
-        f"You are given a video of hand motion in the camera frame.\n"
+def build_wrist_ov2_messages(history_text: str, future_k: int) -> list:
+    """Chat messages with a single video slot for LlavaOnevision2Processor."""
+    user_text = (
+        "You are given a video of hand motion in the camera frame.\n"
         f"{history_text}\n"
         f"Encode the video and history, then predict the next {future_k} wrist positions "
         f"(left and right, xyz in meters) as internal regression targets."
     )
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video"},
+                {"type": "text", "text": user_text},
+            ],
+        }
+    ]
 
 
-def prepare_llava_video_batch(
+def build_wrist_ov2_prompt(processor, history_text: str, future_k: int) -> str:
+    messages = build_wrist_ov2_messages(history_text, future_k)
+    return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+def prepare_ov2_codec_batch(
     processor,
-    video_frame_lists: List[List[Image.Image]],
-    prompts: List[str],
+    video_paths: Sequence[str],
+    prompts: Sequence[str],
+    *,
+    max_pixels: int = DEFAULT_CODEC_MAX_PIXELS,
 ) -> Dict:
-    """Run LlavaOnevisionProcessor on a batch (one video per sample)."""
-    if len(video_frame_lists) == 1:
-        return processor(text=prompts[0], videos=video_frame_lists, return_tensors="pt")
+    """Run LlavaOnevision2Processor with codec video backend on a batch."""
+    video_paths = list(video_paths)
+    prompts = list(prompts)
+    if len(video_paths) != len(prompts):
+        raise ValueError(f"video_paths ({len(video_paths)}) and prompts ({len(prompts)}) length mismatch")
 
-    # Variable-length videos: process per item then pad (frame dim + sequences).
-    items = [processor(text=p, videos=[v], return_tensors="pt") for p, v in zip(prompts, video_frame_lists)]
-    max_frames = max(x["pixel_values_videos"].shape[1] for x in items)
+    if len(video_paths) == 1:
+        return processor(
+            text=[prompts[0]],
+            videos=[video_paths[0]],
+            return_tensors="pt",
+            video_backend="codec",
+            max_pixels=max_pixels,
+        )
+
+    items = [
+        processor(
+            text=[prompt],
+            videos=[video_path],
+            return_tensors="pt",
+            video_backend="codec",
+            max_pixels=max_pixels,
+        )
+        for prompt, video_path in zip(prompts, video_paths)
+    ]
     max_len = max(x["input_ids"].shape[1] for x in items)
-
     pad_id = processor.tokenizer.pad_token_id
     if pad_id is None:
         pad_id = processor.tokenizer.eos_token_id
 
-    batch = {
-        "input_ids": [],
-        "attention_mask": [],
-        "pixel_values_videos": [],
-    }
+    input_ids, attention_mask = [], []
+    pixel_values, image_grid_thw, patch_positions = [], [], []
     for item in items:
-        pv = item["pixel_values_videos"]
-        f_pad = max_frames - pv.shape[1]
-        if f_pad > 0:
-            pad_shape = (pv.shape[0], f_pad, *pv.shape[2:])
-            pv = torch.cat([pv, torch.zeros(pad_shape, dtype=pv.dtype)], dim=1)
-        batch["pixel_values_videos"].append(pv)
-
         ids = item["input_ids"]
         attn = item["attention_mask"]
         seq_pad = max_len - ids.shape[1]
         if seq_pad > 0:
-            ids = torch.cat([ids, torch.full((ids.shape[0], seq_pad), pad_id, dtype=ids.dtype)], dim=1)
-            attn = torch.cat([attn, torch.zeros((attn.shape[0], seq_pad), dtype=attn.dtype)], dim=1)
-        batch["input_ids"].append(ids)
-        batch["attention_mask"].append(attn)
+            ids = torch.cat([ids, torch.full((1, seq_pad), pad_id, dtype=ids.dtype)], dim=1)
+            attn = torch.cat([attn, torch.zeros((1, seq_pad), dtype=attn.dtype)], dim=1)
+        input_ids.append(ids)
+        attention_mask.append(attn)
+        pixel_values.append(item["pixel_values"])
+        image_grid_thw.append(item["image_grid_thw"])
+        patch_positions.append(item["patch_positions"])
 
     return {
-        "input_ids": torch.cat(batch["input_ids"], dim=0),
-        "attention_mask": torch.cat(batch["attention_mask"], dim=0),
-        "pixel_values_videos": torch.cat(batch["pixel_values_videos"], dim=0),
+        "input_ids": torch.cat(input_ids, dim=0),
+        "attention_mask": torch.cat(attention_mask, dim=0),
+        "pixel_values": torch.cat(pixel_values, dim=0),
+        "image_grid_thw": torch.cat(image_grid_thw, dim=0),
+        "patch_positions": torch.cat(patch_positions, dim=0),
     }

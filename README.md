@@ -230,6 +230,16 @@ If you find it useful for your research and applications, please cite related pa
 }
 ```
 
+## Monkey / VITRA (hand VLA)
+
+This repo vendors [VITRA](VITRA/) for dexterous hand action learning on top of **LLaVA-OneVision-2** codec video features.
+
+- Wrist overfit (lightweight head): `scripts/train/wrist_overfit_quick.sh`
+- VITRA head-only overfit / memorize: `VITRA/scripts/run_llava_ov2_memorize.sh`
+- Remote launch on `monkey-cyt`: `VITRA/scripts/exec_monkey_cyt_memorize.sh`
+
+Large artifacts stay local: `VITRA/outputs/`, `VITRA/weights/`, codec caches (see `.gitignore`).
+
 ## Acknowledgement
 
 - [Vicuna](https://github.com/lm-sys/FastChat): the codebase we built upon, and our base model Vicuna-13B that has the amazing language capabilities!

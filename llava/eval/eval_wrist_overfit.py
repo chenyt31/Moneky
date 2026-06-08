@@ -8,10 +8,13 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
+from datasets.epoch_reader import WristEpisodeReader
 from datasets.wrist_video_sft import WristVideoSFTCollator, WristVideoSFTDataset, discover_episode_pairs
+from llava.eval.visualize_wrist_infer import episode_sample_indices_for_ep, render_episode_infer_video
 from llava.train.train_wrist_overfit import OverfitCollator, build_video_cache, evaluate
 from llava.wrist.constants import DEFAULT_CODEC_MAX_PIXELS, DEFAULT_OV2_CKPT
 from llava.wrist.normalize import WristNormStats
@@ -42,6 +45,77 @@ def load_overfit_model(
     return model, ckpt
 
 
+@torch.no_grad()
+def collect_overfit_episode_predictions(
+    model: WristOverfitMLP,
+    dataset: WristVideoSFTDataset,
+    collator: OverfitCollator,
+    episode_idx: int,
+    device: torch.device,
+    *,
+    future_k: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """pred_wrists (T,2,3), pred_mask (T,2) for one episode."""
+    indices = episode_sample_indices_for_ep(dataset, episode_idx)
+    ann = np.load(dataset.episode_pairs[episode_idx]["ann_path"], allow_pickle=True).item()
+    num_frames = len(ann["video_decode_frame"])
+    pred_wrists = np.full((num_frames, 2, 3), np.nan, dtype=np.float32)
+    pred_mask = np.zeros((num_frames, 2), dtype=bool)
+
+    loader = DataLoader(Subset(dataset, indices), batch_size=1, shuffle=False, collate_fn=collator)
+    model.eval()
+
+    for batch in loader:
+        batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+        kwargs = dict(
+            history_wrists=batch["history_wrists"],
+            history_wrist_mask=batch["history_wrist_mask"],
+            history_len=batch["history_len"],
+            episode_idx=batch["episode_idx"],
+            hist_ends=batch["hist_ends"],
+        )
+        if "video_ctx" in batch:
+            kwargs["video_ctx"] = batch["video_ctx"]
+        out = model(**kwargs)
+        pred = out["pred"].detach().cpu().numpy()
+        pmask = batch["future_wrist_mask"].detach().cpu().numpy()
+        t = int(batch["hist_ends"][0].item())
+        for k in range(future_k):
+            j = t + 1 + k
+            if j >= num_frames:
+                break
+            if not pmask[0, k].any():
+                continue
+            for hand in range(2):
+                if pmask[0, k, hand]:
+                    pred_wrists[j, hand] = pred[0, k, hand]
+                    pred_mask[j, hand] = True
+
+    return pred_wrists, pred_mask
+
+
+def save_codec_infer_video(
+    model: WristOverfitMLP,
+    dataset: WristVideoSFTDataset,
+    collator: OverfitCollator,
+    episode_idx: int,
+    output_dir: str,
+    device: torch.device,
+    *,
+    future_k: int,
+    fps: int,
+) -> str:
+    reader = WristEpisodeReader(data_root=dataset.data_root)
+    pred_wrists, pred_mask = collect_overfit_episode_predictions(
+        model, dataset, collator, episode_idx, device, future_k=future_k
+    )
+    ep = reader.load(episode_idx)
+    stem = os.path.splitext(ep.video_name)[0]
+    out_mp4 = os.path.join(output_dir, f"{stem}_codec.mp4")
+    render_episode_infer_video(ep, pred_wrists, pred_mask, out_mp4, future_k=future_k, fps=fps)
+    return out_mp4
+
+
 def main(argv: list[str] | None = None) -> None:
     root = _repo_root()
     if str(root) not in sys.path:
@@ -60,6 +134,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--norm_stats", default=str(root / "outputs" / "wrist_norm_stats.json"))
     p.add_argument("--cpu", action="store_true")
+    p.add_argument("--viz_episode", type=int, default=0, help="Episode index for codec viz mp4 (-1 to skip)")
+    p.add_argument("--fps", type=int, default=10)
     args = p.parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
@@ -118,6 +194,24 @@ def main(argv: list[str] | None = None) -> None:
         f"mae={metrics['mae']:.6f} rmse={metrics['rmse']:.6f}"
     )
     print(f"Wrote {metrics_path}")
+
+    if args.viz_episode >= 0:
+        if args.viz_episode >= len(pairs):
+            raise ValueError(f"viz_episode={args.viz_episode} out of range (n_episodes={len(pairs)})")
+        viz_path = save_codec_infer_video(
+            model,
+            ds,
+            collator,
+            args.viz_episode,
+            args.output_dir,
+            device,
+            future_k=args.future_k,
+            fps=args.fps,
+        )
+        out["viz_codec_mp4"] = viz_path
+        with open(metrics_path, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"Wrote codec viz: {viz_path}")
 
 
 if __name__ == "__main__":

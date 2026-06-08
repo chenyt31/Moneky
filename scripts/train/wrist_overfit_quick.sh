@@ -43,4 +43,4 @@ python llava/eval/eval_wrist_overfit.py \
   --model_name_or_path "$MODEL" \
   --norm_stats "$NORM"
 
-echo "Done. ckpt=$CKPT  eval=${EVAL_OUT}/metrics_train.json"
+echo "Done. ckpt=$CKPT  eval=${EVAL_OUT}/metrics_train.json  viz=${EVAL_OUT}/*_codec.mp4"

@@ -1,0 +1,61 @@
+{
+    "vla_name": "VITRA_LlavaOV2",
+    "task_name": "llava_ov2_memorize",
+    "model": "vitra_llava_ov2",
+    "fwd_pred_next_n": 16,
+    "seed": 42,
+    "batch_size": 1,
+    "output_root": "outputs/vitra_llava_ov2_memorize",
+    "use_bf16": true,
+    "use_fov": true,
+    "untied_cognition_token": true,
+    "use_state": "DiT",
+    "loss_type": "human",
+    "repeated_diffusion_steps": 32,
+    "train_setup": {
+        "freeze_option": "only_head_and_token"
+    },
+    "state_encoder": {
+        "state_dim": 212
+    },
+    "action_model": {
+        "model_type": "DiT-B",
+        "token_size": 4096,
+        "action_dim": 192
+    },
+    "vlm": {
+        "type": "AutoModelForImageTextToText",
+        "name": "llava_ov2",
+        "pretrained_model_name_or_path": "/inspire/ssd/project/robot-reasoning/cengxianchao-240108110052/yangtao/monkey_asset/LLaVA-OneVision-2-8B-Instruct",
+        "use_bf16": true
+    },
+    "train_dataset": {
+        "data_root_dir": "/inspire/ssd/project/robot-reasoning/cengxianchao-240108110052/yangtao/Moneky/data",
+        "statistics_path": "/inspire/ssd/project/robot-reasoning/cengxianchao-240108110052/yangtao/Moneky/data/worldmodelv1_angle_statistics.json",
+        "action_type": "angle",
+        "action_future_window_size": 15,
+        "max_samples": 0,
+        "augmentation": false,
+        "normalization": true
+    },
+    "trainer": {
+        "learning_rate": 1e-5,
+        "action_model_learning_rate": 2e-3,
+        "weight_decay": 0.0,
+        "gradient_clip_val": 1.0,
+        "max_epochs": 80,
+        "max_pixels": 200704,
+        "predict_cfg_scale": 1.0,
+        "predict_ddim_steps": 10,
+        "predict_sample_times": 1,
+        "action_mae_every": 5,
+        "target_action_mae_norm": 0.05,
+        "codec": {
+            "target_canvas": 4,
+            "group_size": 32,
+            "images_per_group": 4,
+            "min_group_frames": 8,
+            "history_frames": 32
+        }
+    }
+}

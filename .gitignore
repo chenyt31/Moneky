@@ -17,6 +17,13 @@ dist
 
 # Local outputs (visualizations, checkpoints, etc.)
 outputs/
+VITRA/outputs/
+VITRA/weights/
+VITRA/**/codec_cache/
+
+# Vendored third-party clones (not part of Moneky)
+pytorch3d/
+cyt-skills/
 # Editor
 .idea
 *.swp
